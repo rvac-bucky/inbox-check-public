@@ -1,0 +1,146 @@
+{
+  "gateway": {
+    "mode": "local",
+    "bind": "lan",
+    "port": 8080,
+    "auth": {
+      "mode": "token"
+    },
+    "controlUi": {
+      "enabled": false
+    },
+    "reload": {
+      "mode": "off"
+    },
+    "http": {
+      "endpoints": {
+        "chatCompletions": {
+          "enabled": true
+        }
+      }
+    },
+    "trustedProxies": [
+      "169.254.0.0/16",
+      "10.0.0.0/8",
+      "172.16.0.0/12"
+    ]
+  },
+  "models": {
+    "providers": {
+      "azure": {
+        "baseUrl": "${AZURE_OPENAI_V1_URL}",
+        "apiKey": "${AZURE_OPENAI_API_KEY}",
+        "api": "openai-completions",
+        "authHeader": true,
+        "models": [
+          {
+            "id": "inboxcheck-mini",
+            "name": "GPT-4.1 mini (Azure)",
+            "input": [
+              "text"
+            ],
+            "contextWindow": 1047576,
+            "cost": {
+              "input": 0.4,
+              "output": 1.6
+            },
+            "compat": {
+              "supportsUsageInStreaming": true,
+              "supportsTools": true
+            }
+          }
+        ]
+      },
+      "azure-luna": {
+        "baseUrl": "${AZURE_OPENAI_V1_URL}",
+        "apiKey": "${AZURE_OPENAI_API_KEY}",
+        "api": "openai-responses",
+        "authHeader": true,
+        "models": [
+          {
+            "id": "inboxcheck-luna",
+            "name": "GPT-6 Luna (Azure)",
+            "reasoning": true,
+            "input": [
+              "text"
+            ],
+            "contextWindow": 272000,
+            "cost": {
+              "input": 0.1,
+              "output": 0.5,
+              "cacheRead": 0.01,
+              "cacheWrite": 0.125
+            },
+            "compat": {
+              "supportsUsageInStreaming": true,
+              "supportsTools": true
+            }
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "entries": {
+      "main": {
+        "identity": {
+          "name": "Inbox Check"
+        }
+      }
+    },
+    "defaults": {
+      "workspace": "/var/lib/openclaw/workspace",
+      "skipBootstrap": true,
+      "model": {
+        "primary": "azure-luna/inboxcheck-luna",
+        "fallbacks": [
+          "azure/inboxcheck-mini"
+        ]
+      },
+      "sandbox": {
+        "mode": "off"
+      },
+      "heartbeat": {
+        "every": "0m"
+      },
+      "thinkingDefault": "off"
+    }
+  },
+  "plugins": {
+    "load": {
+      "paths": [
+        "/opt/inboxcheck/plugin"
+      ]
+    },
+    "entries": {
+      "rva-inboxcheck": {
+        "enabled": true,
+        "config": {
+          "endpoint": "${INBOXCHECK_ENDPOINT}"
+        }
+      }
+    },
+    "allow": [
+      "rva-inboxcheck"
+    ],
+    "slots": {
+      "memory": "none"
+    }
+  },
+  "skills": {
+    "allowBundled": [
+      "inboxcheck-no-bundled-skills"
+    ]
+  },
+  "tools": {
+    "profile": "minimal",
+    "alsoAllow": [
+      "inboxcheck_screen_ticket"
+    ],
+    "deny": [
+      "gateway",
+      "session_status"
+    ],
+    "toolSearch": false
+  }
+}

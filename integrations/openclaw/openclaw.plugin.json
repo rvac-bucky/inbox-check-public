@@ -1,0 +1,32 @@
+{
+  "id": "rva-inboxcheck",
+  "name": "RVA Inbox Check",
+  "description": "Screen suspicious email with Jev, explain evidence with Azure, and escalate to a human reviewer.",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "required": [
+      "endpoint"
+    ],
+    "properties": {
+      "endpoint": {
+        "type": "string",
+        "description": "HTTPS origin of your Inbox Check pilot."
+      },
+      "tokenEnv": {
+        "type": "string",
+        "description": "Environment variable holding an analyze-only pilot token; default INBOXCHECK_AGENT_TOKEN."
+      }
+    },
+    "additionalProperties": false
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "inboxcheck_screen_email",
+      "inboxcheck_screen_ticket"
+    ]
+  }
+}
