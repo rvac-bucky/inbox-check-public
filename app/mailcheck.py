@@ -17,15 +17,16 @@ from email.utils import parseaddr
 
 import httpx
 
-from .core import clean, html_text, InputError, MAX_TEXT
+from .core import clean, html_text, InputError, MAX_TEXT, verdict_view, mime_body_text
 
 log = logging.getLogger('inboxcheck.mail')
 GRAPH = 'https://graph.microsoft.com/v1.0'
 LINK_CODE = re.compile(r'\bIC-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}\b')
 FORWARD_MARKERS = re.compile(
     r'(?im)^(?:-{2,}\s*(?:Forwarded message|Original Message)\s*-{2,}|Begin forwarded message:|_{10,})\s*$')
-RISK_LABELS = {'likely_phishing': 'Likely phishing', 'suspicious': 'Suspicious — verify first',
-               'no_obvious_warning_signs': 'No obvious warning signs', 'insufficient_evidence': 'Not enough evidence'}
+def verdict_colors(risk):
+    v = verdict_view(risk)
+    return {'red': ('#b42318', '#fdecea'), 'yellow': ('#8a5a00', '#fff4d6'), 'green': ('#146c43', '#e6f4ea')}[v['color']]
 
 
 class MailConfig:
@@ -82,10 +83,7 @@ def sender_verified(headers, sender, internal_domains=frozenset()):
 
 def _mime_text(msg):
     pieces = [f'{h}: {str(msg.get(h, ""))}' for h in ('From', 'Reply-To', 'To', 'Subject', 'Date') if msg.get(h)]
-    body = msg.get_body(preferencelist=('plain', 'html'))
-    if body is not None:
-        content = body.get_content()
-        pieces.append(html_text(content) if body.get_content_subtype() == 'html' else content)
+    pieces.append(mime_body_text(msg))
     return '\n'.join(pieces)
 
 
@@ -127,8 +125,6 @@ def forwarded_text(message, attachments):
         text = inline_forward_text(body.get('content') or '', body.get('contentType') or 'html')
         source = 'forwarded email'
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text).strip()
-    if len(text) > MAX_TEXT:
-        text = text[:MAX_TEXT]
     return clean(text), source
 
 
@@ -136,13 +132,14 @@ def forwarded_text(message, attachments):
 
 def reply_body(payload, origin):
     a = payload['assessment']; e = payload.get('explanation') or {}
-    label = RISK_LABELS.get(a['risk'], a['risk'])
+    v = verdict_view(a['risk']); fg, bg = verdict_colors(a['risk'])
     esc = html.escape
-    parts = [f'<p style="font-size:18px"><b>Inbox Check result: {esc(label)}</b></p>']
+    parts = [f'<p style="font-size:20px;padding:12px 16px;border-radius:8px;color:{fg};background:{bg}"><b>{esc(v["label"])}</b>'
+             f'<br><span style="font-size:15px">{esc(v["detail"])}</span></p>']
+    if payload.get('explanation_fallback'):
+        parts.append('<p>Detailed evidence selection was unavailable. The guidance below is based on the screening result.</p>')
     if e.get('summary'):
         parts.append(f'<p>{esc(e["summary"])}</p>')
-    if payload.get('agent_reply'):
-        parts.append(f'<p>{esc(payload["agent_reply"])}</p>')
     if e.get('evidence'):
         parts.append('<p><b>What we noticed</b></p><ul>' + ''.join(f'<li>{esc(x)}</li>' for x in e['evidence']) + '</ul>')
     if e.get('next_steps'):
@@ -150,13 +147,12 @@ def reply_body(payload, origin):
     if origin:
         parts.append(f'<p>You can also paste or upload messages at <a href="{esc(origin)}/">Inbox Check</a>.</p>')
     parts.append('<p style="color:#666;font-size:12px">Automated screening of the text you forwarded, not proof that a message is safe. '
-                 'Sender identity, hidden link targets and attachments were not verified. Do not click links or reply to the '
-                 'original message until you have checked it through a channel you already trust.</p>')
+                 'Sender identity, link destinations and attachment safety were not verified.</p>')
     return '\n'.join(parts)
 
 
 def notice_body(text):
-    return f'<p>{html.escape(text)}</p><p style="color:#666;font-size:12px">RVA Cyber Inbox Check</p>'
+    return f'<p>{html.escape(text)}</p><p style="color:#666;font-size:12px">Inbox Check</p>'
 
 
 # ---------- Microsoft Graph ----------
@@ -211,6 +207,11 @@ class GraphMailbox:
             'saveToSentItems': False})
         r.raise_for_status()
 
+    def hold(self,mid):
+        # Keep the original in Inbox for operator review, but do not let it starve new mail.
+        r=self.client.patch(f'{GRAPH}/users/{self.cfg.mailbox}/messages/{mid}',headers=self._h(),json={'isRead':True})
+        r.raise_for_status()
+
     def finish(self, mid):
         # Deleted, not archived: the case store is the only retained copy, with its own expiry.
         r = self.client.delete(f'{GRAPH}/users/{self.cfg.mailbox}/messages/{mid}', headers=self._h())
@@ -221,13 +222,11 @@ class GraphMailbox:
 
 # ---------- processing ----------
 
-def process_message(message, mailbox, store, screen, cfg):
+def _process_message(message, mailbox, store, screen, cfg):
     """Handle one inbound message. `screen(user, text, source)` returns (case_id, payload).
     Returns a short outcome label for logs (never message content)."""
     mid = message['id']
     key = message.get('internetMessageId') or mid
-    if not store.mail_first_seen(key):
-        mailbox.finish(mid); return 'duplicate'
     headers = header_map(message.get('internetMessageHeaders'))
     sender = (parseaddr(((message.get('from') or {}).get('emailAddress') or {}).get('address') or '')[1] or '').lower()
     if not sender or sender == cfg.mailbox or is_automated(headers) or headers.get('x-inbox-check'):
@@ -257,16 +256,57 @@ def process_message(message, mailbox, store, screen, cfg):
         if len(text) < 20:
             raise InputError('empty')
         cid, payload = screen(u, text, source)
-    except InputError:
-        mailbox.send(sender, 'Inbox Check: nothing to check', notice_body(
-            'We could not find the email to check. Forward the suspicious message itself (or attach it), '
-            'including its sender line and body.'))
+    except InputError as exc:
+        reason = str(exc) if str(exc).startswith('Message is too long.') else 'We could not find the email to check. Forward the suspicious message itself (or attach it), including its sender line and body.'
+        mailbox.send(sender, 'Inbox Check: input needs attention', notice_body(reason))
         mailbox.finish(mid); return 'no_content'
     except Exception as e:  # provider failures: tell the user, imply nothing
         log.warning('mailcheck screening failed: %s', type(e).__name__)
         mailbox.send(sender, 'Inbox Check: check did not complete', notice_body(
             'The check did not complete, so no assessment is implied. Please try again in a few minutes.'))
         mailbox.finish(mid); return 'screen_failed'
-    label = RISK_LABELS.get(payload['assessment']['risk'], 'Result')
+    label = verdict_view(payload['assessment']['risk'])['label']
     mailbox.send(sender, f'Inbox Check: {label}' + (f' — {subject[:120]}' if subject else ''), reply_body(payload, cfg.origin))
     mailbox.finish(mid); return 'replied'
+
+
+class DeliveryMailbox:
+    """Persist a reply before sending. Do not retry a timeout with unknown delivery."""
+    def __init__(self,box,store,key):
+        self.box,self.store,self.key=box,store,key
+        self.send_started=False
+    def attachments(self,mid):return self.box.attachments(mid)
+    def send(self,to,subject,body):
+        self.store.mail_state(self.key,'sending',{'to':to,'subject':subject,'body':body})
+        self.send_started=True
+        try:self.box.send(to,subject,body)
+        except httpx.HTTPStatusError as exc:
+            # Explicit auth/rate-limit rejections did not accept the message.
+            self.store.mail_state(self.key,'retry' if exc.response.status_code in (401,403,429) else 'uncertain')
+            raise
+        except Exception:
+            self.store.mail_state(self.key,'uncertain');raise
+        # Commit success before cleanup. Cleanup failure must never resend a reply.
+        self.store.mail_complete(self.key)
+    def finish(self,mid):
+        self.store.mail_complete(self.key)
+        self.box.finish(mid)
+
+
+def process_message(message,mailbox,store,screen,cfg):
+    key=message.get('internetMessageId') or message['id']
+    state,pending=store.mail_claim(key)
+    if state=='done':
+        mailbox.finish(message['id']);return 'duplicate'
+    if state!='claimed':
+        if state=='held' and hasattr(mailbox,'hold'):mailbox.hold(message['id'])
+        return 'delivery_'+state
+    proxy=DeliveryMailbox(mailbox,store,key)
+    try:
+        if pending:
+            proxy.send(pending['to'],pending['subject'],pending['body'])
+            proxy.finish(message['id']);return 'replied'
+        return _process_message(message,proxy,store,screen,cfg)
+    except Exception:
+        if not proxy.send_started:store.mail_state(key,'retry')
+        raise

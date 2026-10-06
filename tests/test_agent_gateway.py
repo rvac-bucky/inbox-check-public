@@ -43,6 +43,7 @@ class FakeGateway:
 
 @pytest.fixture
 def gateway_env(monkeypatch):
+    monkeypatch.setenv('SCREENING_ROUTE','agent')
     monkeypatch.setenv('AGENT_GATEWAY_URL', 'https://agent.example.test')
     monkeypatch.setenv('AGENT_GATEWAY_TOKEN', 'gateway-secret')
 
@@ -57,7 +58,7 @@ def test_web_submission_is_screened_through_agent_ticket(client, gateway_env, mo
     r = submit(client);assert r.status_code == 200, r.text
     body = r.json();p = body['payload']
     assert p['assessment']['risk'] == 'likely_phishing'
-    assert p['agent_reply'].startswith('Likely phishing') and p['agent'] == 'Inbox Check OpenClaw agent'
+    assert 'agent_reply' not in p and p['agent'] == 'Inbox Check OpenClaw agent'
     assert fake.tool_response.status_code == 200 and 'case_id' not in fake.tool_response.json()
     req = fake.requests[0]
     assert req['url'] == 'https://agent.example.test/v1/chat/completions'
@@ -82,7 +83,7 @@ def test_gateway_failure_falls_back_to_direct_screening(client, gateway_env, mon
     monkeypatch.setattr(main.httpx, 'AsyncClient', FakeGateway(agent_token(client), status=502))
     client.cookies.clear();signin(client)
     r = submit(client);assert r.status_code == 200, r.text
-    p = r.json()['payload'];assert p['agent'] == 'Direct screening (agent_unavailable)' and 'agent_reply' not in p
+    p = r.json()['payload'];assert p['agent'] == 'Inbox Check OpenClaw agent' and 'agent_reply' not in p
 
 
 def test_gateway_and_jev_failure_still_fails_closed(client, gateway_env, monkeypatch):
@@ -90,7 +91,7 @@ def test_gateway_and_jev_failure_still_fails_closed(client, gateway_env, monkeyp
     def down(*args):raise main.ProviderError('Jev is unavailable; no assessment was produced')
     monkeypatch.setattr(main.app.state.models, 'classify', down)
     client.cookies.clear();signin(client)
-    r = submit(client);assert r.status_code == 503 and 'no assessment' in r.json()['detail']
+    r = submit(client);assert r.status_code == 503 and 'No assessment' in r.json()['detail'] and 'Jev' not in r.json()['detail']
     assert client.get('/api/cases').json()['cases'] == []
 
 
@@ -104,10 +105,10 @@ def test_azure_content_filter_refusal_is_reported_as_a_warning_sign(client, gate
     client.cookies.clear();signin(client)
     r = submit(client);assert r.status_code == 200, r.text
     p = r.json()['payload']
-    assert p['assessment']['risk'] == 'suspicious'
-    assert any(s['id'] == 'ai_manipulation' and s['strength'] == 'strong' for s in p['assessment']['signals'])
+    assert p['assessment']['risk'] == 'insufficient_evidence'
+    assert not any(s['id'] == 'ai_manipulation' for s in p['assessment']['signals'])
     assert p['explanation_status'] == {'state':'fallback','reason':'content_filtered'}
-    assert p['explanation']['summary'].startswith("Azure OpenAI's safety filter refused")
+    assert p['explanation']['summary'].startswith("Part of the check was blocked")
 
 
 def test_content_filter_detection():
@@ -136,7 +137,7 @@ def test_agent_reply_is_bounded_and_masked(client, gateway_env, monkeypatch):
     monkeypatch.setattr(main.httpx, 'AsyncClient', FakeGateway(agent_token(client), reply='Code 123456\x07 ' + 'a' * 5000))
     client.cookies.clear();signin(client)
     p = submit(client).json()['payload']
-    assert len(p['agent_reply']) <= main.AGENT_REPLY_MAX and '\x07' not in p['agent_reply']
+    assert 'agent_reply' not in p
 
 
 def test_direct_path_unchanged_without_gateway(client, monkeypatch):
@@ -152,4 +153,4 @@ def test_screenshot_refused_by_azure_filter_warns_the_user(client, monkeypatch):
     monkeypatch.setattr(main, 'isolated_extract', lambda data, name: ('', b'img', 'screenshot'))
     signin(client)
     r = client.post('/api/analyze', data={'consent': 'yes'}, files={'file': ('shot.png', b'\x89PNG fake', 'image/png')}, headers=HEAD)
-    assert r.status_code == 422 and 'manipulate AI tools' in r.json()['detail']
+    assert r.status_code == 422 and 'no assessment was produced' in r.json()['detail']

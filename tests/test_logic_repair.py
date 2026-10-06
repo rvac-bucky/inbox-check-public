@@ -55,7 +55,7 @@ def test_generated_selection_is_grounded_and_cautions_not_rejected():
     r,u=m.explain('We cannot tell whether the email is safe.',assessment)
     assert r['evidence']==['Email excerpt (unverified): “We cannot tell whether the email is safe.”']
     assert 'does not establish authenticity' in r['summary']
-    assert any('Do not use a destination supplied' in x for x in r['next_steps'])
+    assert any('saved bookmark' in x for x in r['next_steps'])
 
 def test_code_redacted_before_azure_and_not_echoed():
     m=Models();captured=[]

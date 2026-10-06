@@ -22,7 +22,7 @@ def test_fallback_reason_preserves_risk_and_accounts_for_rejected_tokens(client,
     assert p['explanation_model']=='Basic guidance (rule-based)'
     assert 'PRIVATE' not in r.text
     assert any('verification codes' in x for x in p['explanation']['next_steps'])
-    assert any('Jev flagged' in x for x in p['explanation']['evidence'])
+    assert any(x.startswith('Flagged: ') for x in p['explanation']['evidence'])
     with app.state.store.db() as c:
         usage=c.execute("select input_tokens,output_tokens from usage where model like '%explanation'").fetchone()
     assert tuple(usage)==(15,9)

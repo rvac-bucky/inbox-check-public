@@ -1,3 +1,4 @@
+import logging
 import hashlib
 import json
 import os
@@ -6,7 +7,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, MultiFernet, InvalidToken
 
 class RateLimited(ValueError):
     pass
@@ -17,7 +18,11 @@ class Store:
     def __init__(self):
         self.path = os.environ.get('DB_PATH','/home/inboxcheck/cases.db')
         Path(self.path).parent.mkdir(parents=True,exist_ok=True)
-        self.box = Fernet(os.environ['DATA_ENCRYPTION_KEY'].encode())
+        # DATA_ENCRYPTION_KEY encrypts; DATA_ENCRYPTION_KEY_PREVIOUS (comma-separated) only
+        # decrypts, and startup re-encrypts every stored row under the current key, so an old
+        # key can be retired as soon as this has run once.
+        previous=[k.strip() for k in os.environ.get('DATA_ENCRYPTION_KEY_PREVIOUS','').split(',') if k.strip()]
+        self.box = MultiFernet([Fernet(k.encode()) for k in [os.environ['DATA_ENCRYPTION_KEY'].strip()]+previous])
         with self.db() as c:
             c.executescript('''
             CREATE TABLE IF NOT EXISTS agent_tokens(hash TEXT PRIMARY KEY,user_id TEXT,expires REAL);
@@ -34,6 +39,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS mail_senders(email TEXT PRIMARY KEY, user_id TEXT NOT NULL, created REAL);
             CREATE TABLE IF NOT EXISTS mail_link_codes(hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires REAL);
             CREATE TABLE IF NOT EXISTS mail_seen(hash TEXT PRIMARY KEY, at REAL);
+            CREATE TABLE IF NOT EXISTS mail_work(hash TEXT PRIMARY KEY, state TEXT NOT NULL, attempts INTEGER NOT NULL, updated REAL NOT NULL, payload BLOB);
             CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
             CREATE INDEX IF NOT EXISTS agent_user ON agent_tokens(user_id);
             CREATE INDEX IF NOT EXISTS cases_user ON cases(user_id);
@@ -48,6 +54,21 @@ class Store:
             DELETE FROM login_attempts;
             ''')
         os.chmod(self.path,0o600)
+        if previous:
+            done,bad=self.rotate_keys()
+            logging.getLogger('inboxcheck.store').warning('data key rotation: %d rows re-encrypted, %d unreadable',done,bad)
+
+    def rotate_keys(self):
+        """Re-encrypt stored rows under the current key. Rows no configured key can read are left
+        untouched (they expire on their own). Returns (rotated, unreadable)."""
+        done=bad=0
+        with self.db() as c:
+            c.execute('BEGIN IMMEDIATE')
+            for table,col,identifier in (('cases','payload','id'),('enrollment_links','secret','id'),('mail_work','payload','hash')):
+                for rid,blob in c.execute(f'SELECT {identifier},{col} FROM {table} WHERE {col} IS NOT NULL').fetchall():
+                    try:c.execute(f'UPDATE {table} SET {col}=? WHERE {identifier}=?',(self.box.rotate(blob),rid));done+=1
+                    except InvalidToken:bad+=1
+        return done,bad
 
     @contextmanager
     def db(self):
@@ -64,6 +85,8 @@ class Store:
         now=time.time()
         for t in ('cases','sessions','invites','agent_tokens','enrollment_links','mail_link_codes'):c.execute(f'DELETE FROM {t} WHERE expires<?',(now,))
         c.execute('DELETE FROM mail_seen WHERE at<?',(now-30*86400,))
+        c.execute("UPDATE mail_work SET payload=NULL,state='failed' WHERE updated<? AND payload IS NOT NULL",(now-86400,))
+        c.execute('DELETE FROM mail_work WHERE updated<?',(now-30*86400,))
         for t in ('attempts','events','usage'):c.execute(f'DELETE FROM {t} WHERE at<?',(now-7*86400,))
         c.execute('DELETE FROM login_buckets WHERE started<?',(now-300,))
         # Preserve ownership of retained cases, including expired-session users.
@@ -136,7 +159,10 @@ class Store:
             c.execute('BEGIN IMMEDIATE');self.purge(c)
             usern=c.execute('SELECT count(*) FROM attempts WHERE user_id=? AND at>?',(uid,time.time()-3600)).fetchone()[0]
             globaln=c.execute('SELECT count(*) FROM attempts WHERE at>?',(time.time()-86400,)).fetchone()[0]
-            if usern>=int(os.environ.get('USER_HOURLY_LIMIT','10')) or globaln>=int(os.environ.get('DAILY_ANALYSIS_LIMIT','100')):return False
+            # Reviewers are exempt from the per-person hourly cap; everyone counts toward the daily cap.
+            role=(c.execute('SELECT role FROM users WHERE id=?',(uid,)).fetchone() or [None])[0]
+            hourly=role!='reviewer' and usern>=int(os.environ.get('USER_HOURLY_LIMIT','10'))
+            if hourly or globaln>=int(os.environ.get('DAILY_ANALYSIS_LIMIT','100')):return False
             c.execute('INSERT INTO attempts VALUES(?,?)',(uid,time.time()));return True
 
     def record_usage(self,model,u):
@@ -300,3 +326,35 @@ class Store:
         """Record a mailbox message once; False means it was already handled (no duplicate replies)."""
         with self.db() as c:
             return c.execute('INSERT OR IGNORE INTO mail_seen VALUES(?,?)',(digest(message_key),time.time())).rowcount==1
+
+    def mail_claim(self, key):
+        """Single-worker leased work. Ambiguous sends never replay automatically."""
+        hashed=digest(key);now=time.time()
+        with self.db() as c:
+            c.execute('BEGIN IMMEDIATE')
+            if c.execute('SELECT 1 FROM mail_seen WHERE hash=?',(hashed,)).fetchone():return 'done',None
+            row=c.execute('SELECT state,attempts,updated,payload FROM mail_work WHERE hash=?',(hashed,)).fetchone()
+            if row:
+                state,attempts,updated,payload=row
+                if state in ('sending','uncertain','failed'):return 'held',None
+                if state=='working' and now-updated<300:return 'busy',None
+                if state=='retry' and now-updated<min(300,30*2**(attempts-1)):return 'busy',None
+                if attempts>=3:
+                    c.execute("UPDATE mail_work SET state='failed' WHERE hash=?",(hashed,));return 'held',None
+                c.execute("UPDATE mail_work SET state='working',attempts=attempts+1,updated=? WHERE hash=?",(now,hashed))
+                return 'claimed',self.decrypt(payload) if payload else None
+            c.execute('INSERT INTO mail_work VALUES(?,?,?,?,NULL)',(hashed,'working',1,now))
+            return 'claimed',None
+
+    def mail_state(self,key,state,payload=None):
+        with self.db() as c:
+            if payload is None:
+                c.execute('UPDATE mail_work SET state=?,updated=? WHERE hash=?',(state,time.time(),digest(key)))
+            else:
+                c.execute('UPDATE mail_work SET state=?,updated=?,payload=? WHERE hash=?',(state,time.time(),self.encrypt(payload),digest(key)))
+
+    def mail_complete(self,key):
+        with self.db() as c:
+            c.execute('BEGIN IMMEDIATE')
+            c.execute('INSERT OR IGNORE INTO mail_seen VALUES(?,?)',(digest(key),time.time()))
+            c.execute('DELETE FROM mail_work WHERE hash=?',(digest(key),))

@@ -3,7 +3,7 @@ import asyncio,time
 from contextlib import asynccontextmanager
 from fastapi import HTTPException
 from starlette.formparsers import MultiPartParser,FormParser,MultiPartException,parse_options_header
-from .core import MAX_FILE
+from .core import MAX_FILE, MAX_TEXT
 MAX_BODY=MAX_FILE+65536
 BODY_IDLE_SECONDS=5.0
 BODY_TOTAL_SECONDS=15.0
@@ -17,7 +17,7 @@ class Limits:
             from starlette.responses import JSONResponse
             return await JSONResponse({'detail':'Service busy; try shortly.'},429)(scope,receive,send)
         self.active+=1;total=0;started=time.monotonic()
-        limit=MAX_BODY if scope['path']=='/api/analyze' else 32768
+        limit=MAX_BODY if scope['path']=='/api/analyze' else 262144 if scope['path']=='/api/agent/analyze' else 32768
         async def bounded():
             nonlocal total
             remaining=BODY_TOTAL_SECONDS-(time.monotonic()-started)
@@ -54,9 +54,9 @@ async def memory_form(request):
         kind,params=parse_options_header(content_type)
         if kind==b'multipart/form-data':
             if not 1<=len(params.get(b'boundary',b''))<=70:raise MultiPartException('Invalid multipart boundary.')
-            parser=MemoryMultipart(request.headers,request.stream(),max_files=1,max_fields=3,max_part_size=24000)
+            parser=MemoryMultipart(request.headers,request.stream(),max_files=1,max_fields=3,max_part_size=MAX_TEXT*4+1024)
         elif kind==b'application/x-www-form-urlencoded':
-            parser=FormParser(request.headers,request.stream(),max_fields=3,max_part_size=24000)
+            parser=FormParser(request.headers,request.stream(),max_fields=3,max_part_size=MAX_TEXT*4+1024)
         else:raise MultiPartException('Use a text or file form.')
         form=await parser.parse()
         keys=[k for k,v in form.multi_items()]

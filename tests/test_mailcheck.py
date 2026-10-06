@@ -128,7 +128,7 @@ def test_linked_sender_gets_a_screened_reply(client):
     out = mailcheck.process_message(message(), box, store, screener(calls), cfg())
     assert out == 'replied' and box.finished == ['m1'] and len(box.sent) == 1
     to, subject, body = box.sent[0]
-    assert to == 'pat@example.org' and subject.startswith('Inbox Check: Likely phishing')
+    assert to == 'pat@example.org' and subject.startswith('Inbox Check: 🔴 RED — Do not act on this message')
     assert '&lt;b&gt;phishing&lt;/b&gt;' in body and '<b>phishing</b>' not in body  # escaped
     assert calls[0][0] == user['id'] and calls[0][1].startswith('From: IT Support')
 
@@ -205,7 +205,7 @@ def test_mail_loop_screens_end_to_end(client, monkeypatch):
     monkeypatch.setattr(main.asyncio, 'sleep', stop)
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(main.mail_loop(app, cfg()))
-    assert len(box.sent) == 1 and box.sent[0][1].startswith('Inbox Check: Likely phishing')
+    assert len(box.sent) == 1 and box.sent[0][1].startswith('Inbox Check: 🔴 RED — Do not act on this message')
     with store.db() as c:
         (n,) = c.execute('SELECT count(*) FROM cases WHERE user_id=?', (user['id'],)).fetchone()
     assert n == 1

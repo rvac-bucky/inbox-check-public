@@ -18,7 +18,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
-from .core import Models, InputError, ProviderError, MAX_FILE, FILE_REJECTIONS, clean, extract_file, fallback_explanation, mark_provider_block
+from .core import Models, InputError, ProviderError, MAX_FILE, FILE_REJECTIONS, clean, extract_file, fallback_explanation, mark_provider_block, strip_external_banners
 from . import mailcheck
 import types
 from .store import Store, digest, RateLimited
@@ -75,7 +75,7 @@ async def mail_loop(app,cfg):
     shim=types.SimpleNamespace(app=app)
     def screen(u,text,source):
         async def run():
-            started=time.monotonic();clean_text=redact(text)
+            started=time.monotonic();clean_text=redact(strip_external_banners(text))
             payload=await (agent_screen(shim,u,clean_text,source,started) if agent_gateway() else direct_screen(shim,clean_text,source,started))
             payload['channel']='email'
             return await run_in_threadpool(app.state.store.save,u['id'],payload),payload
@@ -83,8 +83,11 @@ async def mail_loop(app,cfg):
     while True:
         try:
             for message in await run_in_threadpool(box.unread):
-                outcome=await run_in_threadpool(mailcheck.process_message,message,box,app.state.store,screen,cfg)
-                mlog.info('mailcheck message handled: %s',outcome)
+                try:
+                    outcome=await run_in_threadpool(mailcheck.process_message,message,box,app.state.store,screen,cfg)
+                    mlog.info('mailcheck message handled: %s',outcome)
+                except Exception as exc:
+                    mlog.warning('mailcheck item deferred: %s',type(exc).__name__)
         except asyncio.CancelledError:raise
         except Exception as e:mlog.warning('mailcheck poll failed: %s',type(e).__name__)
         await asyncio.sleep(cfg.interval)
@@ -97,7 +100,7 @@ app.add_middleware(Limits)
 async def safety(request,call_next):
     try:
         length=request.headers.get('content-length')
-        if length and (len(length)>10 or not length.isdigit() or int(length)>(MAX_FILE+65536 if request.url.path=='/api/analyze' else 32768)):raise HTTPException(413,'Request body exceeds its limit.')
+        if length and (len(length)>10 or not length.isdigit() or int(length)>(MAX_FILE+65536 if request.url.path=='/api/analyze' else 262144 if request.url.path=='/api/agent/analyze' else 32768)):raise HTTPException(413,'Request body exceeds its limit.')
         if request.method not in ('GET','HEAD','OPTIONS'):
             origin=request.headers.get('origin','')
             expected=os.environ.get('PUBLIC_ORIGIN',str(request.base_url).rstrip('/'))
@@ -129,6 +132,20 @@ async def json_body(r):
         return data
     except HTTPException:raise
     except Exception:raise HTTPException(400,'Invalid request.') from None
+
+@app.get('/api/operator/status')
+async def operator_status(r:Request):
+    key=os.environ.get('BOOTSTRAP_KEY','')
+    if not key or not secrets.compare_digest(r.headers.get('x-operator-key',''),key):raise HTTPException(403,'Operator access required.')
+    def status():
+        with store(r).db() as c:
+            return {row[0]:row[1] for row in c.execute('SELECT state,count(*) FROM mail_work GROUP BY state')}
+    return {'mail_work':await run_in_threadpool(status),'mail_enabled':r.app.state.mailcfg.enabled}
+
+@app.get('/api/config')
+async def public_config():
+    from .core import VERDICTS
+    return {'site_name':os.environ.get('SITE_NAME','Inbox Check')[:80],'verdicts':VERDICTS}
 
 @app.get('/healthz')
 async def health():return {'status':'ok','service':'inboxcheck'}
@@ -269,6 +286,10 @@ async def change(cid:str,action:str,r:Request):
     return {'ok':True}
 
 async def explain_assessment(r, models, text, assessment):
+    if os.environ.get('EVIDENCE_SELECTION','rules')=='rules':
+        from .evidence import explain
+        return {'explanation':explain(text,assessment),'explanation_status':{'state':'complete','reason':None},
+                'explanation_fallback':False,'explanation_model':'Grounded rule-based guidance','logic_version':'2'}
     try:
         explanation,usage=await run_in_threadpool(models.explain,text,assessment)
         status={'state':'complete','reason':None}
@@ -281,7 +302,12 @@ async def explain_assessment(r, models, text, assessment):
     if usage:await run_in_threadpool(store(r).record_usage,'azure/gpt-4.1-mini:explanation',usage)
     return {'explanation':explanation,'explanation_status':status,
             'explanation_fallback':status['state']=='fallback',
-            'explanation_model':'Azure evidence selection + rule-based guidance' if status['state']=='complete' else 'Basic guidance (rule-based)','logic_version':'2'}
+            'explanation_model':'AI evidence selection + rule-based guidance' if status['state']=='complete' else 'Basic guidance (rule-based)','logic_version':'2'}
+
+def unavailable(e):
+    # Provider names and internals stay in the log; users get one plain message.
+    logging.getLogger('inboxcheck').warning('screening unavailable: %s',e)
+    return HTTPException(503,'The screening service is temporarily unavailable. No assessment was produced; please try again shortly.')
 
 @asynccontextmanager
 async def admission(r,u):
@@ -308,6 +334,7 @@ AGENT_TICKET_SECONDS=150
 AGENT_REPLY_MAX=1200
 
 def agent_gateway():
+    if os.environ.get('SCREENING_ROUTE','direct') == 'direct':return None
     url=os.environ.get('AGENT_GATEWAY_URL','');token=os.environ.get('AGENT_GATEWAY_TOKEN','')
     return (url.rstrip('/'),token) if url.startswith('https://') and token else None
 
@@ -343,11 +370,11 @@ async def agent_screen(r,u,text,source,started):
         except (httpx.HTTPError,KeyError,IndexError,TypeError,ValueError):
             reply=None
         result=AGENT_TICKETS[ticket]['result']
-        if not result or reply is None:
+        if not result:
             # The agent's reply is discarded; Jev screens the same text directly. This covers Azure
             # content-filter refusals of the agent's own model call, which surface here as a failed turn.
             return await direct_screen(r,text,source,started,'agent_unavailable' if reply is None else 'agent_incomplete')
-        return {'text':text,'source':source,**result,'agent_reply':clean_reply(reply),
+        return {'text':text,'source':source,**result,
                 'agent':'Inbox Check OpenClaw agent','seconds':round(time.monotonic()-started,1)}
     finally:AGENT_TICKETS.pop(ticket,None)
 
@@ -364,7 +391,7 @@ async def agent_redeem(r:Request):
         assessment,meta=await run_in_threadpool(m.classify,text)
         await run_in_threadpool(store(r).record_usage,meta['model'],meta['usage'])
         detail=await explain_assessment(r,m,text,assessment)
-    except ProviderError as e:raise HTTPException(503,str(e)) from None
+    except ProviderError as e:raise unavailable(e) from None
     job['result']={'assessment':assessment,**detail,'model':meta['model']}
     return {'assessment':assessment,**detail,'shared':False,'limitation':'Untrusted screening output, not proof of safety. No sender authentication, hidden-link inspection or attachment scan.'}
 
@@ -391,16 +418,16 @@ async def analyze(r:Request):
                     text,usage=await run_in_threadpool(models.ocr,image)
                     await run_in_threadpool(store(r).record_usage,'azure/gpt-4.1-mini:ocr',usage)
                 if len(text)<20:raise InputError('Not enough visible email text. Paste more context.')
-                text=redact(text)
+                text=redact(strip_external_banners(text))
                 payload=await (agent_screen(r,u,text,source,started) if agent_gateway() else direct_screen(r,text,source,started))
                 cid=await run_in_threadpool(store(r).save,u['id'],payload)
                 return {'id':cid,'payload':payload,'owned':True,'shared':False,'expires':time.time()+86400}
         except InputError as e:raise HTTPException(400,str(e)) from None
         except ProviderError as e:
             if e.code=='content_filtered':
-                raise HTTPException(422,"Azure OpenAI refused to read this screenshot because it contains text designed to manipulate AI tools. "
-                                    "That is itself a strong warning sign: treat the email as suspicious and do not act on it.") from None
-            raise HTTPException(503,str(e)) from None
+                raise HTTPException(422,"The screenshot could not be processed by the safety filter. This does not establish whether the email is malicious. "
+                                    "Paste the complete email text or request a human review; no assessment was produced.") from None
+            raise unavailable(e) from None
 
 @app.post('/api/agent-token')
 async def agent_token(r:Request):
@@ -443,7 +470,7 @@ async def agent_analyze(r:Request):
         if len(text)<20:raise HTTPException(400,'Include at least 20 characters.')
         async with model_slot(r):
             try:
-                started=time.monotonic();m=r.app.state.models;text=redact(text)
+                started=time.monotonic();m=r.app.state.models;text=redact(strip_external_banners(text))
                 assessment,meta=await run_in_threadpool(m.classify,text)
                 await run_in_threadpool(store(r).record_usage,meta['model'],meta['usage'])
                 detail=await explain_assessment(r,m,text,assessment)
@@ -451,6 +478,6 @@ async def agent_analyze(r:Request):
                 cid=await run_in_threadpool(store(r).save,u['id'],payload)
                 if d.get('share'):await run_in_threadpool(store(r).change,cid,u,'share')
                 return {'case_id':cid,'assessment':assessment,**detail,'shared':bool(d.get('share')),'limitation':'Untrusted screening output, not proof of safety. No sender authentication, hidden-link inspection or attachment scan.'}
-            except ProviderError as e:raise HTTPException(503,str(e)) from None
+            except ProviderError as e:raise unavailable(e) from None
 
 app.mount('/static',StaticFiles(directory=STATIC),name='static')

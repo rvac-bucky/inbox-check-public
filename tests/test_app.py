@@ -21,6 +21,7 @@ class Fake:
 
 @pytest.fixture
 def client(tmp_path,monkeypatch):
+    monkeypatch.setenv('EVIDENCE_SELECTION','ai')
     monkeypatch.setenv('DB_PATH',str(tmp_path/'cases.db'));monkeypatch.setenv('DATA_ENCRYPTION_KEY',Fernet.generate_key().decode());monkeypatch.setenv('LOCAL_DEV','1');monkeypatch.setenv('PUBLIC_ORIGIN',ORIGIN);monkeypatch.setenv('BOOTSTRAP_KEY','operator-testing-key')
     with TestClient(app) as c:
         app.state.models=Fake();yield c
@@ -99,7 +100,7 @@ def test_limit(client,monkeypatch):
 def test_input_validation(client):
     signin(client)
     assert client.post('/api/analyze',data={'text':'a'*30},headers=HEAD).status_code==400
-    assert client.post('/api/analyze',data={'consent':'yes','text':'a'*18001},headers=HEAD).status_code==400
+    assert client.post('/api/analyze',data={'consent':'yes','text':'a'*50001},headers=HEAD).status_code==400
     assert client.post('/api/analyze',data={'consent':'yes'},files={'file':('payload.exe',b'x')},headers=HEAD).status_code==400
     assert client.post('/api/analyze',data={'consent':'yes','text':'a'*30},files={'file':('a.txt',b'hello')},headers=HEAD).status_code==400
     assert client.post('/api/analyze',content=b'x'*(8*1024*1024+65537),headers=HEAD).status_code==413
@@ -159,8 +160,8 @@ def test_rejected_upload_says_why(client):
     assert r.status_code==400 and 'Supported files' in r.json()['detail']
     r=client.post('/api/analyze',data={'consent':'yes'},files={'file':('outlook.msg',b'From: a@example.test\nnot outlook')},headers=HEAD)
     assert r.status_code==400 and r.json()['detail']=='This MSG file could not be read.'
-    r=client.post('/api/analyze',data={'consent':'yes'},files={'file':('long.txt',b'x'*20000)},headers=HEAD)
-    assert r.status_code==400 and '18,000' in r.json()['detail']
+    r=client.post('/api/analyze',data={'consent':'yes'},files={'file':('long.txt',b'x'*50001)},headers=HEAD)
+    assert r.status_code==400 and '50,000' in r.json()['detail']
 
 def test_image(client):
     signin(client);b=io.BytesIO();Image.new('RGB',(100,100),'white').save(b,'PNG')
@@ -227,3 +228,9 @@ def test_guests_do_not_consume_pilot_seats(client,monkeypatch):
     from app import store as store_mod
     for _ in range(105):app.state.store.start_guest()
     assert app.state.store.invite('Reviewer','reviewer')
+
+def test_long_thread_under_limit_is_accepted(client):
+    signin(client)
+    thread='From: a@example.test\nSubject: Re: invoice\n\n'+('> earlier reply line in a long quoted thread\n'*1100)
+    assert 45000<len(thread)<50000
+    assert client.post('/api/analyze',data={'consent':'yes','text':thread},headers=HEAD).status_code==200

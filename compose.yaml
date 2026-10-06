@@ -1,0 +1,24 @@
+services:
+  inboxcheck:
+    build: .
+    env_file: .env
+    ports:
+      - "127.0.0.1:8094:8094"
+    volumes:
+      - cases:/data
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 1g
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8094/healthz', timeout=5)"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+volumes:
+  cases:
