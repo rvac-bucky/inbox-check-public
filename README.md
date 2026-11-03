@@ -2,7 +2,7 @@
 
 Open-source email risk screening with the same clear result on the web and by email. **MIT licensed.** Bring your own model keys, domain, and Microsoft 365 receiving address, such as `test@your-domain.example`. No RVA Cyber account, agent subscription, or registration is required to self-host.
 
-**A gift from Jim Staley and RVA Cyber.** Use it, study it, change it, and share it under the [MIT license](LICENSE). [Project overview](https://www.rvacyber.com/inbox-check/) · [Self-hosting guide](docs/SELF_HOSTING.md) · [Download the source](https://github.com/rvac-bucky/inbox-check-public/archive/refs/heads/main.zip).
+**Our latest open-source contribution.** Use it, study it, change it, and share it under the [MIT license](LICENSE). [Project overview](https://www.rvacyber.com/inbox-check/) · [Self-hosting guide](docs/SELF_HOSTING.md) · [Download the source](https://github.com/rvac-bucky/inbox-check-public/archive/refs/heads/main.zip).
 
 **Hosted pilot paused — November 2, 2026.** RVA Cyber's `testmyemail.rvacyber.com` service and automated screening at `check@rvacyber.com` are paused. Do not send email or files there expecting an assessment. The source remains available for independent self-hosting; this is not a free hosted service. You supply your own infrastructure and provider credentials, and pay any provider usage charges.
 
